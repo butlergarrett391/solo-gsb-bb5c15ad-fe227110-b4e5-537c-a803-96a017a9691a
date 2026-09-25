@@ -159,6 +159,118 @@ class TestBalancer(unittest.TestCase):
         slots = sorted(x["slot"] for x in r["placements"])
         self.assertEqual(slots, [0, 2])
 
+    def test_shuffled_slots_solved_by_index(self):
+        # 槽位按任意顺序提交, 求解器必须按编号(index)而不是列表下标取角度。
+        p = {
+            "slot_count": 4,
+            "slots": [
+                {"index": 3, "angle": 270}, {"index": 0, "angle": 0},
+                {"index": 2, "angle": 180}, {"index": 1, "angle": 90},
+            ],
+            "radius_mm": 100, "rpm": 4000, "restarts": 4, "chain_steps": 300,
+        }
+        # 锁定管在槽 0: 必须按槽 0 的 0° 计算 U1=(+mR, 0), 而非列表首位槽 3 的 270°
+        p["tubes"] = [{"id": 1, "mass": 50, "locked": True, "slot": 0}]
+        r = run_plan(p)
+        pl = next(x for x in r["placements"] if x["tube_id"] == 1)
+        self.assertEqual(pl["slot"], 0)
+        self.assertAlmostEqual(pl["angle"], 0.0)
+        self.assertAlmostEqual(pl["u1"]["x"], 5000.0, places=6)
+        self.assertAlmostEqual(pl["u1"]["y"], 0.0, places=6)
+        # 落库几何与 slot_state 均按槽号 0..n-1 排列
+        self.assertEqual([s["index"] for s in p["slots"]], [0, 1, 2, 3])
+        self.assertEqual(p["slot_count"], 4)
+        self.assertEqual([s["slot"] for s in r["slot_state"]], [0, 1, 2, 3])
+
+    def test_shuffled_slots_optimal_matches_ordered(self):
+        # 同一几何乱序与顺序提交的最优指标必须一致; 等质量对应落对径槽 0/2。
+        def payload(slots):
+            return {
+                "slot_count": 4,
+                "slots": slots,
+                "tubes": [{"id": 1, "mass": 100, "locked": True, "slot": 2},
+                          {"id": 2, "mass": 100}],
+                "radius_mm": 100, "rpm": 3000,
+                "restarts": 6, "chain_steps": 600, "seed": 7,
+            }
+        ordered = [{"index": i, "angle": a}
+                   for i, a in enumerate((0, 95, 180, 272))]
+        shuffled = [ordered[i] for i in (3, 1, 0, 2)]
+        r1 = run_plan(payload(ordered))
+        r2 = run_plan(payload(json.loads(json.dumps(shuffled))))
+        self.assertAlmostEqual(r1["metrics"]["u1_mag_g_mm"],
+                               r2["metrics"]["u1_mag_g_mm"], places=6)
+        loc2 = {x["tube_id"]: x["slot"] for x in r2["placements"]}
+        self.assertEqual(loc2, {1: 2, 2: 0})
+
+    def test_shuffled_angles_drive_ring_adjacency(self):
+        # 物理相邻关系按实际角度排序, 与提交顺序、槽号差无关。
+        p = {
+            "slot_count": 4,
+            "slots": [
+                {"index": 3, "angle": 250}, {"index": 2, "angle": 120},
+                {"index": 1, "angle": 10}, {"index": 0, "angle": 350},
+            ],
+            "tubes": [
+                {"id": 1, "mass": 50, "locked": True, "slot": 0},
+                {"id": 2, "mass": 50}, {"id": 3, "mass": 50},
+            ],
+            "radius_mm": 100, "rpm": 4000, "restarts": 4, "chain_steps": 300,
+            "mutex_pairs": [{"tube_a": 1, "tube_b": 2}],
+        }
+        r = run_plan(p)
+        # 角序 槽1(10)-槽2(120)-槽3(250)-槽0(350): 槽0 的物理邻槽是 {1,3}
+        edges = {tuple(sorted(e)) for e in r["exact_search"]["adjacent_slot_pairs"]}
+        self.assertEqual(edges, {(0, 1), (0, 3), (1, 2), (2, 3)})
+        loc = {x["tube_id"]: x["slot"] for x in r["placements"]}
+        self.assertNotIn(loc[2], (1, 3))
+        self.assertEqual(loc[2], 2)
+
+    def test_default_angles_by_index_when_omitted(self):
+        p = {
+            "slot_count": 6,
+            # 乱序、省略或显式置空 angle: 默认角度按槽号 360*index/n 生成
+            "slots": [{"index": 5}, {"index": 2, "enabled": True},
+                      {"index": 0, "angle": None}, {"index": 4},
+                      {"index": 1}, {"index": 3}],
+            "radius_mm": 100, "rpm": 4000, "restarts": 4, "chain_steps": 300,
+        }
+        p["tubes"] = [{"id": 1, "mass": 10}]
+        run_plan(p)
+        angles = {s["index"]: s["angle"] for s in p["slots"]}
+        for i in range(6):
+            self.assertAlmostEqual(angles[i], 60.0 * i)
+
+    def test_duplicate_missing_and_nonfinite_slots_rejected(self):
+        base = {
+            "slot_count": 4,
+            "slots": [{"index": i, "angle": 90.0 * i} for i in range(4)],
+            "radius_mm": 100, "rpm": 4000, "restarts": 2, "chain_steps": 100,
+            "tubes": [{"id": 1, "mass": 10}],
+        }
+        dup = json.loads(json.dumps(base))
+        dup["slots"][1]["index"] = 0
+        with self.assertRaises(ValueError):
+            run_plan(dup)
+        missing = json.loads(json.dumps(base))
+        missing["slots"] = [s for s in missing["slots"] if s["index"] != 2]
+        with self.assertRaises(ValueError):
+            run_plan(missing)
+        oob = json.loads(json.dumps(base))
+        oob["slots"][3]["index"] = 4
+        with self.assertRaises(ValueError):
+            run_plan(oob)
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            nf = json.loads(json.dumps(base))
+            # NaN/Inf 经 JSON 往返会变成 null, 这里直接构造载荷
+            nf2 = dict(nf)
+            nf2["slots"] = [
+                {"index": i, "angle": (bad if i == 1 else 90.0 * i)}
+                for i in range(4)
+            ]
+            with self.assertRaises(ValueError):
+                run_plan(nf2)
+
     def test_pair_and_singleton_explanations(self):
         r = run_plan(self.six_tubes())
         for pr in r["pairs"]:

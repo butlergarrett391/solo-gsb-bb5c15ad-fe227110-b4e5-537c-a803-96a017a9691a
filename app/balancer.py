@@ -23,6 +23,73 @@ TWO_PI = 2.0 * math.pi
 
 
 # ---------------------------------------------------------------------------
+# 槽位几何规范化
+# ---------------------------------------------------------------------------
+def canonicalize_slots(raw: Any, slot_count: int) -> list[dict[str, Any]]:
+    """把提交的槽位列表按 ``index`` 规范化为覆盖 0..n-1 的唯一序列。
+
+    槽号是求解器内外一致使用的身份标识(锁定槽、增量重放、互斥相邻、
+    返回摆放与落库几何均按槽号索引), 与列表提交顺序无关。本函数:
+
+    - ``slots`` 为空/缺省时, 生成 0..slot_count-1 的均布默认槽;
+    - 显式给出的槽位编号必须落在 [0, slot_count) 且**不重复、不缺失**;
+    - 角度省略或为 null 时, 按槽号生成默认均布角度 360°·index/n
+      (n 取规范化后的实际槽数, 即显式槽位数);
+    - 显式角度必须为有限数, NaN/Inf 一律拒绝;
+    - 返回结果按槽号升序排列, 使"列表下标 == 槽号", 供求解器直接索引。
+
+    规范化是幂等的: 对已经规范化的列表再次调用只做校验、不改写角度。
+    """
+    n_decl = int(slot_count)
+    if raw:
+        entries: list[dict[str, Any]] = []
+        seen: set[int] = set()
+        for s in raw:
+            try:
+                idx = int(s["index"])
+            except (KeyError, TypeError, ValueError):
+                raise ValueError("每个槽位必须给出整数编号 index。")
+            if not (0 <= idx < n_decl):
+                raise ValueError(
+                    f"槽位编号 {s.get('index')} 超出范围(应为 0~{n_decl - 1})。"
+                )
+            if idx in seen:
+                raise ValueError(f"槽位编号 {idx} 重复。")
+            seen.add(idx)
+            angle = s.get("angle")
+            if angle is None:
+                ang: Optional[float] = None
+            else:
+                ang = float(angle)
+                if not math.isfinite(ang):
+                    raise ValueError(f"槽位 {idx} 的角度必须是有限数值。")
+            entries.append({
+                "index": idx,
+                "angle": ang,
+                "enabled": bool(s.get("enabled", True)),
+            })
+        if len(entries) != n_decl:
+            missing = sorted(set(range(n_decl)) - seen)
+            raise ValueError(
+                f"槽位编号必须恰好覆盖 0~{n_decl - 1}; 缺失编号: "
+                f"{', '.join(map(str, missing))}。"
+            )
+        entries.sort(key=lambda x: x["index"])
+        n = len(entries)
+        for e in entries:
+            if e["angle"] is None:
+                e["angle"] = 360.0 * e["index"] / n
+        return [
+            {"index": e["index"], "angle": float(e["angle"]), "enabled": e["enabled"]}
+            for e in entries
+        ]
+    return [
+        {"index": i, "angle": 360.0 * i / n_decl, "enabled": True}
+        for i in range(n_decl)
+    ]
+
+
+# ---------------------------------------------------------------------------
 # 几何工具
 # ---------------------------------------------------------------------------
 def _d(angle_deg: float) -> float:
@@ -107,9 +174,24 @@ class Solver:
         if not self.slots:
             raise ValueError("至少需要定义一个槽位。")
         n = len(self.slots)
+        # 求解器内部以"列表下标 == 槽号"索引; 规范化阶段保证二者一致,
+        # 这里对直接构造 Solver 的调用方再做一次完整防御:
+        # 编号必须恰好覆盖 0..n-1 且不重复, 角度必须有限。
+        seen_idx: set[int] = set()
         for s in self.slots:
-            if not (0 <= s.index < n):
+            if not isinstance(s.index, int) or not (0 <= s.index < n):
                 raise ValueError(f"槽位索引 {s.index} 超出范围。")
+            if s.index in seen_idx:
+                raise ValueError(f"槽位编号 {s.index} 重复。")
+            seen_idx.add(s.index)
+            if not math.isfinite(float(s.angle)):
+                raise ValueError(f"槽位 {s.index} 的角度必须是有限数值。")
+        missing = sorted(set(range(n)) - seen_idx)
+        if missing:
+            raise ValueError(
+                "槽位编号必须恰好覆盖 0~%d; 缺失编号: %s。"
+                % (n - 1, ", ".join(map(str, missing)))
+            )
         seen = set()
         for s in self.slots:
             if not s.enabled:
@@ -1257,13 +1339,19 @@ def _parse_mutex_pairs(raw: Any) -> list[tuple[int, int]]:
 
 def run_plan(payload: dict[str, Any]) -> dict[str, Any]:
     """API 层入口: 解析 JSON 风格的请求并求解。"""
+    slot_count = int(payload.get("slot_count", len(payload.get("slots") or [])))
+    # 按槽号规范化(乱序合法输入按编号求解; 重复/缺失/非有限角度抛 ValueError)。
+    # 同时回写 payload, 使落库请求与实际求解几何一致。
+    norm_slots = canonicalize_slots(payload.get("slots"), slot_count)
+    payload["slots"] = norm_slots
+    payload["slot_count"] = len(norm_slots)
     slots = [
         Slot(
             index=int(s["index"]),
-            angle=float(s.get("angle", 360.0 * int(s["index"]) / int(payload["slot_count"]))),
+            angle=float(s["angle"]),
             enabled=bool(s.get("enabled", True)),
         )
-        for s in payload["slots"]
+        for s in norm_slots
     ]
     tubes = [
         Tube(

@@ -15,7 +15,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from .balancer import run_plan
+from .balancer import canonicalize_slots, run_plan
 from .batch import plan_batch_sequence
 from .calibration import predict_single_weight_balancing
 from .compare import compare_plans
@@ -262,18 +262,20 @@ def get_config() -> dict[str, Any]:
 
 
 def _normalize_slots(req: PlanRequest) -> list[dict[str, Any]]:
-    if req.slots:
-        return [s.model_dump() for s in req.slots]
-    return [
-        {"index": i, "angle": 360.0 * i / req.slot_count, "enabled": True}
-        for i in range(req.slot_count)
-    ]
+    """按槽号规范化: 乱序提交按编号求解, 缺省角度按槽号生成均布默认角度。
+
+    重复/缺失编号、越界编号与非有限角度抛 ValueError(在 /api/plan 中转为 400)。
+    """
+    return canonicalize_slots(
+        [s.model_dump() for s in req.slots], req.slot_count
+    )
 
 
 def _build_payload(req: PlanRequest) -> dict[str, Any]:
+    slots = _normalize_slots(req)
     return {
-        "slot_count": req.slot_count,
-        "slots": _normalize_slots(req),
+        "slot_count": len(slots),
+        "slots": slots,
         "tubes": [t.model_dump() for t in req.tubes],
         "radius_mm": req.radius_mm,
         "rpm": req.rpm,
@@ -292,8 +294,8 @@ def _build_payload(req: PlanRequest) -> dict[str, Any]:
 
 @app.post("/api/plan")
 def create_plan(req: PlanRequest) -> dict[str, Any]:
-    payload = _build_payload(req)
     try:
+        payload = _build_payload(req)
         t0 = time.perf_counter()
         result = run_plan(payload)
         solve_ms = (time.perf_counter() - t0) * 1000.0

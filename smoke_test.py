@@ -263,6 +263,57 @@ try:
 except main.HTTPException as e:
     assert e.status_code==400; print("validation 400 OK:",e.detail)
 
+# 自定义槽位按任意顺序提交: 必须按 index 规范化后求解, 保存的几何/指标与之一致
+shuf_body=dict(req_body); shuf_body["name"]="乱序槽位方案"; shuf_body["save"]=False
+shuf_body["slots"]=[
+    {"index":11,"angle":330},{"index":3,"angle":90},{"index":7,"angle":210},
+    {"index":0,"angle":0},{"index":5,"angle":150},{"index":9,"angle":270},
+    {"index":2,"angle":60},{"index":6,"angle":180,"enabled":False},
+    {"index":1,"angle":30},{"index":10,"angle":300},
+    {"index":4,"angle":120},{"index":8,"angle":240},
+]
+shuf=call("POST","/api/plan",shuf_body)
+sp=shuf["result"]["placements"]
+# 锁定管 5 在槽 0: 角度必须是 0° 而不是列表首位槽 11 的 330°
+lk=next(p for p in sp if p["tube_id"]==5)
+assert lk["slot"]==0 and abs(lk["angle"]-0.0)<1e-9, lk
+assert abs(lk["u1"]["x"]-3000.0)<1e-6 and abs(lk["u1"]["y"])<1e-6, lk["u1"]
+# 禁用槽 6 仍不被占用; 摆放角度与槽号几何一致
+assert all(p["slot"]!=6 for p in sp)
+ang_by_idx={i:i*30 for i in range(12)}
+for p in sp:
+    assert abs(p["angle"]-ang_by_idx[p["slot"]])<1e-9, p
+# slot_state 按槽号 0..11 返回
+assert [s["slot"] for s in shuf["result"]["slot_state"]]==list(range(12))
+print("shuffled slots OK: locked u1=(%.1f,%.1f)" % (lk["u1"]["x"], lk["u1"]["y"]))
+
+# 省略/置空角度按槽号生成默认均布角度; 乱序同样合法
+default_body=dict(req_body); default_body["name"]="默认角度乱序"; default_body["save"]=False
+default_body["slots"]=[{"index":i} for i in (11,0,5,3,7,2,9,1,10,4,8,6)]
+dr=call("POST","/api/plan",default_body)
+# 规范化发生在落库请求中(save=False 时响应不含 id, 结果几何仍是均布)
+assert all(abs(s["angle"]-30*s["slot"])<1e-9 for s in dr["result"]["slot_state"])
+
+# 重复/缺失编号与非有限角度返回 400
+for bad_slots,tag in (
+    ([{"index":i,"angle":i*30} for i in range(12)]+[{"index":0,"angle":0}], "重复编号"),
+    ([{"index":i,"angle":i*30} for i in range(11)], "缺失编号"),
+):
+    bad=dict(req_body); bad["slots"]=bad_slots
+    try:
+        call("POST","/api/plan",bad); raise SystemExit("should 400: "+tag)
+    except main.HTTPException as e:
+        assert e.status_code==400, (tag, e.status_code)
+        print("slot %s 400 OK: %s" % (tag, e.detail))
+for bad_ang in (float("nan"), float("inf")):
+    bad=dict(req_body)
+    bad["slots"]=[{"index":i,"angle":(bad_ang if i==2 else i*30)} for i in range(12)]
+    try:
+        call("POST","/api/plan",bad); raise SystemExit("should 400: non-finite")
+    except main.HTTPException as e:
+        assert e.status_code==400
+        print("non-finite angle 400 OK:", e.detail)
+
 # 增量重排
 inc=dict(req_body); inc["name"]="增量方案"
 inc["tubes"]=[dict(t) for t in req_body["tubes"]]+[{"id":7,"mass":20}]
