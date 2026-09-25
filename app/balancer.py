@@ -107,20 +107,31 @@ class Solver:
         if not self.slots:
             raise ValueError("至少需要定义一个槽位。")
         n = len(self.slots)
-        for s in self.slots:
+        # 槽位列表必须按编号(index)规范化: 列表下标即槽号, 编号唯一且覆盖 0..n-1
+        seen: set[int] = set()
+        for pos, s in enumerate(self.slots):
             if not (0 <= s.index < n):
                 raise ValueError(f"槽位索引 {s.index} 超出范围。")
-        seen = set()
+            if s.index != pos:
+                raise ValueError(
+                    f"槽位未按编号规范化: 位置 {pos} 上的槽位编号为 {s.index}。"
+                )
+            if s.index in seen:
+                raise ValueError(f"槽位编号 {s.index} 重复。")
+            seen.add(s.index)
+            if not math.isfinite(s.angle):
+                raise ValueError(f"槽位 {s.index} 的角度必须是有限数值。")
+        enabled = {s.index for s in self.slots if s.enabled}
+        if not enabled:
+            raise ValueError("至少需要启用一个槽位。")
+        seen_angles: set[float] = set()
         for s in self.slots:
             if not s.enabled:
                 continue
             key = round(s.angle % 360.0, 6)
-            if key in seen:
+            if key in seen_angles:
                 raise ValueError(f"槽位 {s.index} 与其他启用槽位角度重复({s.angle}°)。")
-            seen.add(key)
-        enabled = {s.index for s in self.slots if s.enabled}
-        if not enabled:
-            raise ValueError("至少需要启用一个槽位。")
+            seen_angles.add(key)
         ids = set()
         for t in self.tubes:
             if t.id in ids:
@@ -1255,15 +1266,69 @@ def _parse_mutex_pairs(raw: Any) -> list[tuple[int, int]]:
     return pairs
 
 
+def normalize_slots(raw_slots: Any, slot_count: Any) -> list[dict[str, Any]]:
+    """把提交的槽位列表按编号规范化为覆盖 0..n-1 的唯一有序序列。
+
+    - raw_slots 为空(缺省 slots)时, 按 slot_count 生成均布角度的 n 个槽位;
+    - 显式给出 slots 时, 槽数 n = len(raw_slots), 编号必须恰好覆盖 0..n-1:
+      重复或缺失编号抛 ValueError(API 层映射为 400); 允许任意提交顺序,
+      返回列表按编号排序, 使"列表下标 == 槽号", 求解器不再误把下标当槽号;
+    - angle 省略或为 None 时, 按槽号生成默认角度 360·index/n;
+      角度必须为有限数, NaN/Inf 抛 ValueError;
+    - enabled 省略时按 True 处理。
+    """
+    if raw_slots is None or len(raw_slots) == 0:
+        count = int(slot_count)
+        return [
+            {"index": i, "angle": 360.0 * i / count, "enabled": True}
+            for i in range(count)
+        ]
+
+    n = len(raw_slots)
+    if n > 128:
+        raise ValueError(f"槽位数量最多 128 个, 当前 {n} 个。")
+    normalized: dict[int, dict[str, Any]] = {}
+    for raw in raw_slots:
+        idx = int(raw["index"])
+        if not (0 <= idx < n):
+            raise ValueError(
+                f"槽位编号 {idx} 超出范围: {n} 个槽位的编号必须覆盖 0..{n - 1}。"
+            )
+        if idx in normalized:
+            raise ValueError(f"槽位编号 {idx} 重复: 每个槽位只能定义一次。")
+        angle = raw.get("angle")
+        if angle is None:
+            angle = 360.0 * idx / n
+        try:
+            angle = float(angle)
+        except (TypeError, ValueError):
+            raise ValueError(f"槽位 {idx} 的角度必须是数值。")
+        if not math.isfinite(angle):
+            raise ValueError(f"槽位 {idx} 的角度必须是有限数值, 不能为 NaN 或无穷大。")
+        normalized[idx] = {
+            "index": idx,
+            "angle": angle,
+            "enabled": bool(raw.get("enabled", True)),
+        }
+    missing = [i for i in range(n) if i not in normalized]
+    if missing:
+        raise ValueError(
+            f"槽位编号缺失: {missing}。{n} 个槽位的编号必须恰好覆盖 0..{n - 1}。"
+        )
+    return [normalized[i] for i in range(n)]
+
+
 def run_plan(payload: dict[str, Any]) -> dict[str, Any]:
     """API 层入口: 解析 JSON 风格的请求并求解。"""
+    slot_count = int(payload.get("slot_count", 12))
+    norm_slots = normalize_slots(payload.get("slots"), slot_count)
     slots = [
         Slot(
             index=int(s["index"]),
-            angle=float(s.get("angle", 360.0 * int(s["index"]) / int(payload["slot_count"]))),
+            angle=float(s["angle"]),
             enabled=bool(s.get("enabled", True)),
         )
-        for s in payload["slots"]
+        for s in norm_slots
     ]
     tubes = [
         Tube(
